@@ -1,0 +1,25 @@
+# Credenciales y certificados de dispositivos: NUNCA subirlos
+*.pem
+*.key
+*.crt
+*.private.key
+certs/
+.env
+.aws/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Artefactos de build
+build/
+*.zip
+packaged-template.yaml
+
+# SO / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
