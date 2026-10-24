@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Supervisión IoT de robots de almacén: IoT Core -> Lambda -> S3 (Bronze) y
+  DynamoDB (Silver), alertas por SNS y supervisión de dispositivos sin datos.
+  El código de las Lambdas se empaqueta con `aws cloudformation package`
+  (ver infrastructure/scripts/deploy.ps1).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: sci-almacen
+    Description: Prefijo para nombrar los recursos.
+  AlertEmail:
+    Type: String
+    Description: Correo que recibirá las alertas (se debe confirmar la suscripción).
+  BatteryMinPct:
+    Type: Number
+    Default: 20
+  MotorCurrentMaxA:
+    Type: Number
+    Default: 5.0
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Retención de logs de CloudWatch (control de costos).
+
+Resources:
+  # ---------------------------------------------------------------- Bronze
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: archivar-datos-antiguos
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 180
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Statement:
+          - Sid: SoloTLS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt RawBucket.Arn
+              - !Sub "${RawBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ---------------------------------------------------------------- Silver
+  TelemetryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH      # partition key: dispositivo
+        - AttributeName: sk
+          KeyType: RANGE     # sort key: "<ts>#<event_id>" o "LATEST"
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------- Alertas
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "${ProjectName}-alertas"
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------- IAM (mínimo privilegio)
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: procesar-telemetria
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${RawBucket.Arn}/telemetria/*"
+              - Effect: Allow
+                Action: [dynamodb:PutItem]
+                Resource: !GetAtt TelemetryTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  SupervisorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: supervisar-dispositivos
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:UpdateItem]
+                Resource: !GetAtt TelemetryTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  # ---------------------------------------------------------------- Lambdas
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-process-telemetry"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SupervisorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-supervise-devices"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ProcessorLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-process-telemetry"
+      Runtime: python3.11
+      Handler: process_telemetry.handler
+      Code: ../../src/lambdas          # `aws cloudformation package` lo sube a S3
+      Role: !GetAtt ProcessorRole.Arn
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TelemetryTable
+          BUCKET_NAME: !Ref RawBucket
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          BATTERY_MIN_PCT: !Ref BatteryMinPct
+          MOTOR_CURRENT_MAX_A: !Ref MotorCurrentMaxA
+
+  SupervisorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SupervisorLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-supervise-devices"
+      Runtime: python3.11
+      Handler: supervise_devices.handler
+      Code: ../../src/lambdas
+      Role: !GetAtt SupervisorRole.Arn
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TelemetryTable
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          TIMEOUT_SECONDS: "60"
+
+  # ---------------------------------------------------------------- Entrada: IoT Core
+  TelemetryRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub
+        - "${Prefix}_telemetria"
+        - Prefix: !Join ["_", !Split ["-", !Ref ProjectName]]
+      TopicRulePayload:
+        Sql: "SELECT * FROM 'almacen/robots/+/telemetria'"
+        AwsIotSqlVersion: "2016-03-23"
+        RuleDisabled: false
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt ProcessorFunction.Arn
+
+  IotInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !GetAtt TelemetryRule.Arn
+
+  # ---------------------------------------------------------------- Supervisión periódica
+  SupervisorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Id: supervisor
+          Arn: !GetAtt SupervisorFunction.Arn
+
+  SupervisorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SupervisorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SupervisorSchedule.Arn
+
+  # ---------------------------------------------------------------- Observabilidad
+  ProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-errores-procesamiento"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+Outputs:
+  BucketName:
+    Value: !Ref RawBucket
+  TableName:
+    Value: !Ref TelemetryTable
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  IotTopicPattern:
+    Value: almacen/robots/<device_id>/telemetria
